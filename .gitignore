@@ -15,6 +15,7 @@ dist/
 venv/
 env/
 ENV/
+downloads/
 
 # Tool caches
 .pytest_cache/
@@ -35,6 +36,7 @@ htmlcov/
 # Logs
 *.log
 server_run.log
+logs/
 
 # Env files
 .env
@@ -44,6 +46,7 @@ server_run.log
 # Outputs (keep folder, ignore contents)
 downloads/*
 !downloads/.gitkeep
+downloads/batch/.checkpoint.json
 
 # Node (if any)
 node_modules/

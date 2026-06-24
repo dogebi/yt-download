@@ -101,18 +101,18 @@ uv pip install fastapi uvicorn yt-dlp
 ```
 4) 실행
 ```bash
-python -m uvicorn server.app:app --host 127.0.0.1 --port 3001 --reload
+python -m uvicorn server.app:app --host 127.0.0.1 --port 3011 --reload
 ```
 5) 접속
 ```bash
-open http://127.0.0.1:3001
+open http://127.0.0.1:3011
 ```
 - `server/app.py` — FastAPI + yt-dlp 백엔드(API + 정적 UI 서빙, SSE 진행률, 파일명/중복 처리, 결과 전송 후 폴더 정리)
 - `web/index.html` — 단일 파일 Web UI(포맷 조회/선택, 모달 진행률/속도/ETA 표시)
 - `downloads/` — 출력 파일 저장 위치(완료 후 백그라운드 정리)
 
 ## 사용법(초보자용 요약)
-1) 브라우저에서 `http://127.0.0.1:3001` 접속
+1) 브라우저에서 `http://127.0.0.1:3011` 접속
 2) 유튜브 URL 입력 → "포맷 조회" 클릭
 3) 해상도/비트레이트 드롭다운에서 원하는 값 선택(기본값은 최고 품질 자동 선택)
 4) "MP4 다운로드" 또는 "MP3 다운로드" 클릭

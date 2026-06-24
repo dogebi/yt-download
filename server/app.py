@@ -17,9 +17,15 @@ import asyncio
 import threading
 import time
 import json
+import sys
+import io
 from queue import Queue, Empty
 
 import yt_dlp
+
+# Windows 환경에서 콘솔 인코딩 문제(GLK) 대비
+if sys.stdout and hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 
 # 기본 설정
@@ -32,7 +38,8 @@ WEB_DIR = BASE_DIR / "web"
 OUTPUT_NAMING_TEMPLATE = "{title}_{id}.%(ext)s"
 
 # yt-dlp 기본 포맷 규칙(영상/오디오)
-DEFAULT_VIDEO_FMT = "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+# 최고 해상도 우선: bestvideo(720p 이상 선호) + bestaudio(최고음질)
+DEFAULT_VIDEO_FMT = "bestvideo[ext=mp4][vcodec^=avc1][height>=720]+bestaudio[ext=m4a]/bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 DEFAULT_AUDIO_FMT = "bestaudio/best"
 
 DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
@@ -40,6 +47,30 @@ WEB_DIR.mkdir(exist_ok=True, parents=True)
 
 logger = logging.getLogger("ytserver")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+
+
+def guess_media_type(file_path: str) -> str:
+    """다운로드 파일 확장자에 맞는 MIME 타입을 반환한다."""
+    ext = Path(file_path).suffix.lower()
+    if ext == ".mp4":
+        return "video/mp4"
+    if ext in {".m4a", ".aac"}:
+        return "audio/mp4"
+    if ext in {".mp3", ".mpeg", ".mpga"}:
+        return "audio/mpeg"
+    if ext == ".webm":
+        return "video/webm"
+    if ext == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
+
+
+def is_complete_download(file_path: Path) -> bool:
+    """yt-dlp의 .part/임시 파일을 제외하고 실제 완료 파일만 인정한다."""
+    try:
+        return file_path.exists() and file_path.is_file() and not file_path.name.endswith(".part")
+    except Exception:
+        return False
 
 
 def sanitize_filename(name: str) -> str:
@@ -50,13 +81,22 @@ def sanitize_filename(name: str) -> str:
 
 
 def ydl_base_opts() -> Dict[str, Any]:
-    """yt-dlp 공통 옵션 생성(로그 최소화, 과도한 출력 억제)"""
+    """yt-dlp 공통 옵션 생성(로그 최소화, 네트워크/SSL 회복력 강화)"""
     return {
         "quiet": True,
         "noprogress": True,
         "ignoreerrors": False,
         "no_warnings": True,
         "cachedir": False,
+        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
+        "remote_components": "ejs:github",
+        "socket_timeout": 30,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 10,
+        "nocheckcertificate": True,
+        "sleep_interval": 1,
+        "max_sleep_interval": 10,
         # outtmpl은 다운로드 시점에 명시적으로 지정한다.
     }
 
@@ -87,6 +127,21 @@ def _remove_ext_placeholder(outtmpl: str) -> str:
     if outtmpl.endswith(suffix):
         return outtmpl[: -len(suffix)]
     return outtmpl
+
+
+def find_completed_download(outtmpl_base: str) -> Optional[str]:
+    """완료된 실제 파일만 찾아 반환한다. .part 파일은 제외한다."""
+    try:
+        search_base = Path(_remove_ext_placeholder(outtmpl_base)).name
+        candidates = sorted(
+            [p for p in DOWNLOAD_DIR.glob(f"{search_base}.*") if is_complete_download(p)],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return str(candidates[0]) if candidates else None
+    except Exception:
+        logger.exception("완료 파일 탐색 실패")
+        return None
 
 
 def ensure_unique_outtmpl(outtmpl: str) -> str:
@@ -373,18 +428,15 @@ def _create_job(url: str, dlt_type: str, format_id: Optional[str]) -> str:
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 ydl.download([url])
 
-            # 최종 파일 경로 결정: 훅에서 받은 경로 우선, 없으면 템플릿 기반 탐색
+            # 최종 파일 경로 결정: 훅에서 받은 경로 우선, 없으면 완료 파일만 템플릿 기반 탐색
             file_path = final_path_holder.get("path")
+            if file_path and not is_complete_download(Path(file_path)):
+                file_path = None
+
             if not file_path:
-                search_base = Path(_remove_ext_placeholder(outtmpl_base)).name
-                candidates = sorted(
-                    DOWNLOAD_DIR.glob(f"{search_base}.*"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if not candidates:
+                file_path = find_completed_download(outtmpl_base)
+                if not file_path:
                     raise FileNotFoundError("출력 파일을 찾지 못했습니다.")
-                file_path = str(candidates[0])
 
             _JOBS[job_id]["file_path"] = str(file_path)
             _JOBS[job_id]["is_done"] = True
@@ -403,14 +455,8 @@ def _create_job(url: str, dlt_type: str, format_id: Optional[str]) -> str:
             # 파일이 이미 존재하면 에러 대신 완료로 처리(일부 훅 미발화 대비)
             try:
                 # 템플릿 기반으로 한 번 더 탐색
-                search_base = Path(_remove_ext_placeholder(outtmpl_base)).name
-                candidates = sorted(
-                    DOWNLOAD_DIR.glob(f"{search_base}.*"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if candidates:
-                    fp = str(candidates[0])
+                fp = find_completed_download(outtmpl_base)
+                if fp:
                     _JOBS[job_id]["file_path"] = fp
                     _JOBS[job_id]["is_done"] = True
                     complete_payload = {"type": "completed", "filename": Path(fp).name}
@@ -509,10 +555,11 @@ def download_result(job_id: str, background_tasks: BackgroundTasks) -> FileRespo
         raise HTTPException(status_code=202, detail="아직 파일이 준비되지 않았습니다.")
 
     filename = os.path.basename(file_path)
+    media_type = guess_media_type(file_path)
     # 응답 전송 후 백그라운드로 폴더 정리 + 잡 정리 수행
     background_tasks.add_task(_cleanup_downloads_dir)
     background_tasks.add_task(_cleanup_job, job_id)
-    return FileResponse(path=file_path, filename=filename, media_type="application/octet-stream")
+    return FileResponse(path=file_path, filename=filename, media_type=media_type)
 
 
 @app.get("/api/download")
@@ -568,20 +615,16 @@ def download(
             ydl.download([url])
 
         # 결과 파일 탐색(템플릿 기반, 접미사 포함 대응)
-        search_base = Path(_remove_ext_placeholder(outtmpl_base)).name
-        candidates = sorted(
-            DOWNLOAD_DIR.glob(f"{search_base}.*"), key=lambda p: p.stat().st_mtime, reverse=True
-        )
-        if not candidates:
+        file_path = find_completed_download(outtmpl_base)
+        if not file_path:
             # 훅 미발화 대비: yt-dlp가 직접 리턴한 파일 경로가 있는지 검사할 수 없으므로 502 처리
             raise FileNotFoundError("출력 파일을 찾지 못했습니다.")
-        file_path = candidates[0]
 
-        download_name = file_path.name
+        download_name = Path(file_path).name
         return FileResponse(
             path=str(file_path),
             filename=download_name,
-            media_type="application/octet-stream",
+            media_type=guess_media_type(file_path),
         )
     except HTTPException:
         raise
@@ -598,6 +641,6 @@ if __name__ == "__main__":
     import uvicorn
 
     # 개발 편의 실행: uvicorn server.app:app --reload --port 3001
-    uvicorn.run("server.app:app", host="0.0.0.0", port=3001, reload=True)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=3310, reload=True)
 
 
